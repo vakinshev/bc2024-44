@@ -1,130 +1,105 @@
-const { program } = require("commander");
-const http = require("http");
-const fsp = require("node:fs/promises");
-const path = require("node:path");
-const superagent = require("superagent");
-function preparing() {
-    program
-        .option("-h, --host <value>", "Host location")
-        .option("-p, --port <value>", "Port location")
-        .option("-c, --cache <value>", "Cache location");
-    program.parse();
+const http = require('http');
+const { program } = require('commander');
+const fs = require('fs').promises;
+const path = require('path');
+const superagent = require('superagent');
 
-    const options = program.opts();
+program
+  .requiredOption('-h, --host <host>', 'Server host')
+  .requiredOption('-p, --port <port>', 'Server port')
+  .requiredOption('-c, --cache <path>', 'Path to cache directory')
+  .parse(process.argv);
 
-    if (!options.host || !options.port || !options.cache) {
-        throw new Error("Please, specify necessary parameters.");
+const options = program.opts();
+
+const getCacheFilePath = (code) => path.join(options.cache, `${code}.jpg`);
+
+const fetchImageFromHttpCat = async (code) => {
+  const url = `https://http.cat/${code}`;
+  try {
+    const response = await superagent.get(url);
+    return response.body;
+  } catch (error) {
+    throw new Error('Failed to fetch image from http.cat');
+  }
+};
+
+const server = http.createServer(async (req, res) => {
+  const method = req.method;
+  const urlParts = req.url.split('/');
+  const code = urlParts[1];
+
+  if (!code) {
+    res.statusCode = 400;
+    res.end('HTTP code not specified');
+    return;
+  }
+
+  const filePath = getCacheFilePath(code);
+
+  try {
+    switch (method) {
+      case 'GET':
+        try {
+          const data = await fs.readFile(filePath);
+          res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+          res.end(data);
+        } catch (error) {
+          if (error.code === 'ENOENT') {
+            try {
+              const imageData = await fetchImageFromHttpCat(code);
+              await fs.writeFile(filePath, imageData);
+              res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+              res.end(imageData);
+            } catch (fetchError) {
+              res.statusCode = 404;
+              res.end('Image not found on http.cat');
+            }
+          } else {
+            res.statusCode = 500;
+            res.end('Server error');
+          }
+        }
+        break;
+
+      case 'PUT':
+        let body = [];
+        req.on('data', chunk => {
+          body.push(chunk);
+        }).on('end', async () => {
+          body = Buffer.concat(body);
+          await fs.writeFile(filePath, body);
+          res.statusCode = 201;
+          res.end('Image saved');
+        });
+        break;
+
+      case 'DELETE':
+        try {
+          await fs.unlink(filePath);
+          res.statusCode = 200;
+          res.end('Image deleted');
+        } catch (error) {
+          if (error.code === 'ENOENT') {
+            res.statusCode = 404;
+            res.end('Image not found');
+          } else {
+            res.statusCode = 500;
+            res.end('Server error');
+          }
+        }
+        break;
+
+      default:
+        res.statusCode = 405;
+        res.end('Method not allowed');
     }
+  } catch (error) {
+    res.statusCode = 500;
+    res.end('Server error');
+  }
+});
 
-    return options;
-}
-
-const options = preparing();
-
-function getCachedPicture(way) {
-    return fsp.readFile(way);
-}
-
-function cachePicture(way, data) {
-    return fsp.writeFile(way, data);
-}
-
-function deleteCachedPicture(way) {
-    return fsp.unlink(way);
-}
-
-function downloadPicture(code) {
-    const url = `https://http.cat/${code}`;
-    return superagent.get(url).buffer(true);
-}
-
-function debug(req, code) {
-    console.log(`Request method: ${req.method}\tResponse code: ${code}`);
-}
-
-//--------------------------------------------//
-function requestListener(req, res) {
-    if (req.url === "/") {
-        res.writeHead(404);
-        res.end();
-        debug(req, 404);
-        return;
-    }
-
-    const code = req.url.slice(1);
-    const way = path.join(__dirname, options.cache, `${code}.jpg`);
-
-    switch (req.method) {
-        case "GET":
-            getCachedPicture(way)
-                .then((result) => {
-                    res.writeHead(200, { "Content-Type": "image/jpeg" });
-                    res.end(result);
-                    debug(req, 200);
-                })
-                .catch(() => {
-                    downloadPicture(code)
-                        .then((result) => {
-                            cachePicture(way, result.body);
-                            res.writeHead(200, { "Content-Type": "image/jpeg" });
-                            res.end(result.body);
-                            debug(req, 200);
-                        })
-                        .catch(() => {
-                            res.writeHead(404);
-                            res.end();
-                            debug(req, 404);
-                        });
-                });
-            break;
-
-        case "PUT":
-            let data = [];
-            req.on("data", (chunk) => {
-                data.push(chunk);
-            });
-            req.on("end", () => {
-                cachePicture(way, Buffer.concat(data))
-                    .then(() => {
-                        res.writeHead(201);
-                        res.end();
-                        debug(req, 201);
-                    })
-                    .catch(() => {
-                        res.writeHead(500);
-                        res.end("Internal Server Error");
-                    });
-            });
-            break;
-
-        case "DELETE":
-            deleteCachedPicture(way)
-                .then(() => {
-                    res.writeHead(200);
-                    res.end();
-                    debug(req, 200);
-                })
-                .catch(() => {
-                    res.writeHead(404);
-                    res.end();
-                    debug(req, 404);
-                });
-            break;
-
-        default:
-            res.writeHead(405);
-            res.end();
-            debug(req, 405);
-            break;
-    }
-}
-//--------------------------------------------------//
-function main() {
-    const server = http.createServer(requestListener);
-
-    server.listen(options.port, options.host, () => {
-        console.log(`Server running at http://${options.host}:${options.port}`);
-    });
-}
-
-main();
+server.listen(options.port, options.host, () => {
+  console.log(`Server running at http://${options.host}:${options.port}/`);
+});
